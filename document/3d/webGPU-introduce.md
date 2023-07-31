@@ -32,7 +32,7 @@
 # 도형 그리기
 ## GPU의 그리기 방식 이해하기
 1. GPU는 점, 선, 삼각형(WebGPU에서 이를 primitive로 지정함)만 처리한다.
-2. 점, 또는 정점은 Catesian 좌표계의 한 점을 정의하는 X, Y, Z 값으로 정의된다.
+2. 점, 또는 정점은 Cartesian 좌표계의 한 점을 정의하는 X, Y, Z 값으로 정의된다.
     1. 캔버스의 너비 또는 높이에 관계없이 X축의 가장 왼쪽이 -1, 오른쪽이 +1, Y축의 가장 아래쪽이 -1, 위쪽이 +1. (0,0)은 언제나 캔버스의 중심.
 3. GPU는 꼭짓점 셰이더를 통해 꼭짓점을 클립 공간으로 변환한다.
     1. 이 셰이더로 꼭짓점에서 광원까지 방향도 계산할 수 있다.
@@ -239,3 +239,164 @@ pass.draw(vertices.length / 2); // 6 vertices
 1. `setPipeline()`: 그리는 데 사용해야 하는 파이프라인을 나타낸다. 사용되는 셰이더, 버텍스 데이터의 레이아웃 및 기타 관련 상태 데이터를 포함한다.
 2. `setVertexBuffer()`: 정사각형의 꼭짓점 버퍼를 사용하여 `setVertexBuffer()`를 호출한다. 현재 파이프라인의 `vertex.buffers` 정의에 있는 0번째 요소에 해당하므로 `0`로 호출한다.
 3. `draw()`: 매우 간단하다. 렌더해야하는 vertices의 숫자를 전달해야한다. 지금은 6개이므로 6을 넣으면된다. 하지만 수식으로 표현하는 것이 더 확장성이 좋다. `vertices.length / 2`(12개의 floats / vertex당 2개의 좌표)
+
+# 그리드 그리기
+이번 챕터에서 다루는 내용은  
+* JS에서 shader로 변수(uniform이라 불린다) 전달하기.
+* 렌더링 동작을 변경하기 위해서 uniforms를 어떻게 사용하는지.
+* 동일한 도형에 다양한 변형을 그리기 위해 instancing을 사용하는 법
+
+## 그리드 정의
+1. 2의 배수로 하면 나중에 편하다.
+2. 상수로 정의한다.
+    ```javascript
+    const GRID_SIZE = 4;
+    ```
+## uniform buffer 생성
+1. 설정한 grid size를 shader에게 전달해야한다. shader에 size를 hard-code할 수도 있지만, grid size를 변경할 때마다 shader와 render-pipie를 새로 생성하는 비싼 연산을 처리해야한다. 따라서 grid size를 shader에게 *uniforms로* 전달해야한다.
+2. 모든 vertex shader가 실행될 때마다, vertex buffer의 다른 값들은 전달된다.
+3. uniform은 매 실행마다 동일한 버퍼의 값이다. 따라서 도형의 조각들이 공유하는 값들, full frame animation, 아니면 app의 전체 lifespan의 값들을 전달하는데 유용하다.
+4. uniform buffer 생성 코드
+    ```javascript
+    // Create a uniform buffer that describes the grid.
+    const uniformArray = new Float32Array([GRID_SIZE, GRID_SIZE]);
+    const uniformBuffer = device.createBuffer({
+    label: "Grid Uniforms",
+    size: uniformArray.byteLength,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
+    ```
+    1. vertex buffer를 만드는 것과 거의 동일한 코드이다. 왜냐하면, WebGPU API는 vertices들이 있는 동일한 GPUbuffer 객체를 통해서 통신하기 때문이다. 다른 점은 `usage`에서 `GPUBufferUsage.VERTEX`대신 `GPUBufferUsage.UNIFORM`를 쓴다는 점이다.
+## shader에서 uniforms에 접근
+1. ```java
+    // At the top of the `code` string in the createShaderModule() call
+    @group(0) @binding(0) var<uniform> grid: vec2f;
+
+    @vertex
+    fn vertexMain(@location(0) pos: vec2f) ->
+        @builtin(position) vec4f {
+        return vec4f(pos / grid, 0, 1);
+    }
+
+    // ...fragmentMain is unchanged 
+    ```
+2. 위 코드는 uniform을 `grid`로 정의했다. 2D float vector여서 uniform buffer에 바로 복사하면된다.
+3. `@group`과 `@binding`에 대해서는 나중에 다룬다.
+4. 다른 shader 코드 어디서든, grid vector를 쓸 수 있게 됐다.
+5. `vec4f(pos / grid, 0, 1);`는 `vec2f(pos.x / grid.x, pos.y / grid.y)`와 동일하다.
+6. 많은 rendering, compute 기술에 의존하기 때문에, 이런 벡터 연산은 GPU shader에서 매우 흔하다.
+7. 위 코드는 결국 기본 사이즈에 1/4로 줄일 것이다(grid size = 4)
+
+## Bind Group 생성
+1. uniform을 선언하는 것 만으로는 buffer가 연결되지 않는다. `bind group`을 만들고 설정해야한다.
+2. bind group은 shader에서 동시에 접근가능하게 만들고 싶은 자원들의 집합이다. uniform buffer와 같은 여러 유형의 버퍼와 texture, sampler와 같은 자원들이 포함될 수 있다.
+3. ```javascript
+    const bindGroup = device.createBindGroup({
+      label: "Cell renderer bind group",
+      layout: cellPipeline.getBindGroupLayout(0),
+      entries: [{
+        binding: 0,
+        resource: { buffer: uniformBuffer }
+      }],
+    });
+    ```
+    1. `layout`: 이 bind group이 포함할 자원들의 타입을 설명. 파야할 내용들이 있지만 지금은 `layout: "auto"`이므로 pipeline에 요청만 하면 된다. `getBindGroupLayout(0)`으로 요청하면되고, `0`은 shader에서 `@group(0)`과 대응된다.
+    2. `entries`: 각 entry는 다음 최소한 값들을 가지는 dictionary이다
+        1. `binding`: shader에 입력한 `@binding()`에 대응되는 값이다. 지금은 `0`이다.
+        2. `resource`: 실제로 binding index의 변수에 노출시키고 싶은 자원이다. 지금은 `uniform buffer`이다.
+    3. 이 함수는 불투명하고, 불변한 핸들인 GPUBindGroup을 반환한다. 따라서 bind group이 생성된 다음 가리키는 자원들은 변경할 수 없다.
+## Bind group 연결
+1. WebGPU에게 그려달라고 요청해야한다.
+2. ```javascript
+    pass.setPipeline(cellPipeline);
+    pass.setVertexBuffer(0, vertexBuffer);
+
+    pass.setBindGroup(0, bindGroup); // New line!
+
+    pass.draw(vertices.length / 2);
+    ```
+    1. `0`은 shader 코드내의 `@group(0)`에 전달된다. `@group(0)`의 부분인 각 `@binding`은 이 bind group내의 자원들을 사용한다고 말하는 것이다.
+## shader에서 도형 조작하기
+![center](./webGPU-introduce/center.png)
+1. 지금은 중앙에 블럭이 위치한다. 왜냐하면 그냥 비율에 맞춰서 줄이기만 한 것이기 때문이다.
+2. Cartesian 좌표계에서 총 가로가 2. 한 셀당 너비가 1/2이므로 x, y로 1/4씩 이동해야 좌측 하단이 anchor가 된다.
+3. 따라서 x, y 좌표에 1씩 증가시킨 다음 grid 개수로 나눠준다면, x, y로 1/4씩 이동한다.
+4. 여기서 x, y에 1씩 감소시키면 0,0이 cartesian 좌표의 좌측 하단(-1,-1)로 평행이동한다.
+    ```java
+    @group(0) @binding(0) var<uniform> grid: vec2f;
+
+    @vertex
+    fn vertexMain(@location(0) pos: vec2f) ->
+    @builtin(position) vec4f {
+        // Subtract 1 after dividing by the grid size.
+        let gridPos = (pos + 1) / grid - 1;
+
+        return vec4f(gridPos, 0, 1); 
+    }
+    ```
+5. ![cell](./webGPU-introduce/cell.png)
+    원하는 cell의 좌표를 입력하면 해당 위치로 이동시키게 만드려면 다음과 같이 코드를 수정한다.
+    ```java
+        @group(0) @binding(0) var<uniform> grid: vec2f;
+
+        @vertex
+        fn vertexMain(@location(0) pos: vec2f) ->
+        @builtin(position) vec4f {
+            let cell = vec2f(1, 1);
+            let cellOffset = cell / grid * 2; // Updated
+            let gridPos = (pos + 1) / grid - 1 + cellOffset;
+
+            return vec4f(gridPos, 0, 1);
+        }
+    ```
+
+## Draw instances
+모든 grid에 square를 위치시키는 것이 목표이다.
+1. uniform을 매번 업데이트하고 `draw`를 호출하면 너무 느리다. GPU가 새로운 좌표를 JS가 전달해줄 때까지 기다려야하기 때문이다.
+2. 대신 **instancing**이란 기술을 사용할 수 있다. instancing은 한번의 `draw` 호출로 GPU에게 동일한 도형의 여러 사본을 그리라고 요청하는 것이다.
+3. ```javascript
+    // pass.draw(vertices.length / 2); // 기존 코드
+    pass.draw(vertices.length / 2, GRID_SIZE * GRID_SIZE);
+    ```
+    위 코드를 작성하면 필요한 숫자 만큼의 square를 그린다(16번). 하지만 동일한 위치에 모든 instance가 생성되어서 화면에 변화가 없다.
+4. shader에서는 vertex 버퍼에 있는 pos와 같은 vertex 속성에다가 WGSL의 *built-in values*에 접근할 수 있다. 여기에는 WebGPU로 계산된 값들이 있고, 그중 하나가 `instance_index`이다. `instance_index`는 uint32로 0~instance의 수 -1 이고, shader logic의 부분에서 사용할 수 있다. 각 vertex shader는 6번씩 호출되는데 처음에는 0, 그다음에는 1, 그다음에는 2,... 이런 식으로 진행된다.
+5. 이 action을 보기 위해서, `instance_index` built-in을 shader input에 넣어야한다.
+다음 코드를 넣으면, 대각선으로 사각형이 채워진다.
+    ```java
+    @group(0) @binding(0) var<uniform> grid: vec2f;
+
+    @vertex
+    fn vertexMain(@location(0) pos: vec2f,
+                @builtin(instance_index) instance: u32) ->
+    @builtin(position) vec4f {
+    
+    let i = f32(instance); // Save the instance_index as a float
+    let cell = vec2f(i, i);
+    let cellOffset = cell / grid * 2; // Updated
+    let gridPos = (pos + 1) / grid - 1 + cellOffset;
+
+    return vec4f(gridPos, 0, 1);
+    }
+    ```
+6. 다음과 같이 수정하면 모든 칸을 다 채울 수 있다.
+    ```java
+    @group(0) @binding(0) var<uniform> grid: vec2f;
+
+    @vertex
+    fn vertexMain(@location(0) pos: vec2f,
+                @builtin(instance_index) instance: u32) ->
+    @builtin(position) vec4f {
+
+    let i = f32(instance);
+    // Compute the cell coordinate from the instance_index
+    let cell = vec2f(i % grid.x, floor(i / grid.x));
+
+    let cellOffset = cell / grid * 2;
+    let gridPos = (pos + 1) / grid - 1 + cellOffset;
+
+    return vec4f(gridPos, 0, 1);
+    }
+    ```
+7. 그리드 사이즈만 늘리면 더 세분화 할 수 있다.
+![full grid](./webGPU-introduce/fullGrid.png)
