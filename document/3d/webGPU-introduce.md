@@ -400,3 +400,126 @@ pass.draw(vertices.length / 2); // 6 vertices
     ```
 7. 그리드 사이즈만 늘리면 더 세분화 할 수 있다.
 ![full grid](./webGPU-introduce/fullGrid.png)
+
+# Extra credit: make it more colorful!
+## shader에서 structs 사용하기
+1. 지금까지는 data를 vertex shader 밖에서 전달했다.
+2. 하지만, 더 많은 데이터를 vertex shader로 받을 수 있고, fragment shader에게 전달할 수 있다.
+3. vertex shader에서 밖으로 데이터를 전달할 수 있는 유일한 방법은 값을 반환하는 것이다. Vertex shader는 항상 position을 반환하기 때문에, 데이터와 함께 그것을 반환하기 위해서는 struct안에 위치시켜야한다.
+4. Structs는 WGSL에서 한개 이상의 named properties를 가지는 named 객체이다.
+5. Properties들은 `@builtin`, `@location`과 같은 속성들을 표기할 수 있다.
+6. 함수 바깥에서 선언하면, 그 instance들을 함수 안과 바깥에서 전달할 수 있다.
+7. 다음 코드는 동일한 내용을 나타낸다.
+    ```java
+    @group(0) @binding(0) var<uniform> grid: vec2f;
+
+    @vertex
+    fn vertexMain(@location(0) pos: vec2f,
+                @builtin(instance_index) instance: u32) -> 
+    @builtin(position) vec4f {
+
+    let i = f32(instance);
+    let cell = vec2f(i % grid.x, floor(i / grid.x));
+    let cellOffset = cell / grid * 2;
+    let gridPos = (pos + 1) / grid - 1 + cellOffset;
+    
+    return  vec4f(gridPos, 0, 1);
+    }
+    ```
+
+    ```java
+    struct VertexInput {
+    @location(0) pos: vec2f,
+    @builtin(instance_index) instance: u32,
+    };
+
+    struct VertexOutput {
+    @builtin(position) pos: vec4f,
+    };
+
+    @group(0) @binding(0) var<uniform> grid: vec2f;
+
+    @vertex
+    fn vertexMain(input: VertexInput) -> VertexOutput  {
+    let i = f32(input.instance);
+    let cell = vec2f(i % grid.x, floor(i / grid.x));
+    let cellOffset = cell / grid * 2;
+    let gridPos = (input.pos + 1) / grid - 1 + cellOffset;
+    
+    var output: VertexOutput;
+    output.pos = vec4f(gridPos, 0, 1);
+    return output;
+    }
+    ```
+8. input 위치와 instance index를 input과 함께 정의하는 것을 필요로한다. 그리고 반환한 그 struct는 변수로 선언되고, 각각의 properties들이 정의되어있어야한다.
+9. shader가 커지고 복잡해질 때, structs는 데이터를 정리하기 좋은 방법이다.
+## vertex와 fragment 함수 사이에 데이터 전달
+1. 지금 fragment 함수는 단색을 나타내는 아주 간단한 함수이다.
+2. 위치에따라 색상을 변경시키려면, `@vertex` 단계에서 어떤 cell이 render될지 알고 있으므로 이를 `@fragment` 단계에 전달시켜야한다.
+3. `@location`과 함께 output struct에 이 데이터를 포함시켜야한다.
+4. 코드
+    ```java
+    struct VertexInput {
+    @location(0) pos: vec2f,
+    @builtin(instance_index) instance: u32,
+    };
+
+    struct VertexOutput {
+    @builtin(position) pos: vec4f,
+    @location(0) cell: vec2f, // New line!
+    };
+
+    @group(0) @binding(0) var<uniform> grid: vec2f;
+
+    @vertex
+    fn vertexMain(input: VertexInput) -> VertexOutput  {
+    let i = f32(input.instance);
+    let cell = vec2f(i % grid.x, floor(i / grid.x));
+    let cellOffset = cell / grid * 2;
+    let gridPos = (input.pos + 1) / grid - 1 + cellOffset;
+    
+    var output: VertexOutput;
+    output.pos = vec4f(gridPos, 0, 1);
+    output.cell = cell; // <- New line!
+    return output;
+    }
+    ```
+5. `@fragment` 함수에서는, @location과 동일한 인수를 추가해서 값을 받는다. (이름이 같을 필요는 없다, 하지만 동일하게 하는 것이 읽기 쉽다)
+    ```java
+    @fragment
+    fn fragmentMain(@location(0) cell: vec2f) -> @location(0) vec4f {
+    // Remember, fragment return values are (Red, Green, Blue, Alpha)
+    // and since cell is a 2D vector, this is equivalent to:
+    // (Red = cell.x, Green = cell.y, Blue = 0, Alpha = 1)
+    return vec4f(cell, 0, 1);
+    }
+    ```
+
+    또는 이렇게 해도 된다.
+
+    ```java
+    struct FragInput {
+        @location(0) cell: vec2f,
+    };
+
+    @fragment
+    fn fragmentMain(input: FragInput) -> @location(0) vec4f {
+        return vec4f(input.cell, 0, 1);
+    }
+    ```
+6. 지금 code는 동일한 shader module에서 정의되었기 때문에, @vertex 단계의 output struct를 재사용해도 된다. 이름과 위치들이 자연스럽게 유지되기 때문에 이 방법이 제일 간단하다.
+    ```java
+    @fragment
+    fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+        return vec4f(input.cell, 0, 1);
+    }
+    ```
+7. 전달된 값을 잘 조절해서 색상을 맞춰줄 수 있다.
+    ```java
+    @fragment
+    fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+        let c = input.cell / grid;
+        return vec4f(c, 1-c.x, 1);
+    }
+    ```
+    ![static-gradation](./webGPU-introduce/static-gradation.png)
