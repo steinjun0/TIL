@@ -523,3 +523,222 @@ pass.draw(vertices.length / 2); // 6 vertices
     }
     ```
     ![static-gradation](./webGPU-introduce/static-gradation.png)
+
+# cell 상태 관리
+1. GPU에 저장된 상태를 기반으로 어떤 cell이 render될지 제어하는 것이 목표.
+2. 각 cell의 on/off signal이 필요하므로, 거의 모든 type의 큰 배열을 저장할 수 있게 해주는 모든 option을 사용할 수 있다.
+3. uniform buffer는 제한된 크기로 이를 구현하기 힘들다. 가변 크기의 배열을 지원하지 않고, compute shader로 작성될 수 없다.
+4. GPU의 연산만으로 Simulation을 하기위해서는, 마지막 단점이(compute shader로 작성안됨) 가장 큰 문제이다.
+## storage buffer 생성
+1. Storage buffer는 compute shader에서 읽고 써질 수 있고, vertex shader에서 읽을 수 있는 범용 buffer이다.
+2. Storage buffer는 일반적인 메모리와 같이 매우 커질 수 있으며, shader에서 크기를 특정할 필요가 없다.
+> **NOTE**: Storage Buffer가 더 유연하지만, uniform buffer에 비해서 성능이 떨어진다. 빠르게 읽고 쓰는 데이터는 uniform에 작성하는 것이 더 안전하고 성능상으로 좋다.
+3. storage buffer 생성 코드
+    ```javascript
+    // Create an array representing the active state of each cell.
+    const cellStateArray = new Uint32Array(GRID_SIZE * GRID_SIZE);
+
+    // Create a storage buffer to hold the cell state.
+    const cellStateStorage = device.createBuffer({
+        label: "Cell State",
+        size: cellStateArray.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    ```
+    1. `device.createBuffer()`를 적절한 크기로 호출하고, usage를 `GPUBufferUsage.STORAGE`로 지정한다.
+4. 같은 크기의 값을 가지는 TypedArray로 buffer를 채우기 전에, buffer를 조작할 수 있다. 그런 다음 device.queue.writeBuffer()를 호출한다. 왜냐하면, grid에서 buffer의 효과를 보기 위해서, 예측 가능한 것으로 채우기 시작해야하기 때문이다.
+5. cellStateArray를 조작해서 cellStateArray를 채우는 코드
+    ```javascript
+        // Mark every third cell of the grid as active.
+        for (let i = 0; i < cellStateArray.length; i += 3) {
+        cellStateArray[i] = 1;
+        }
+        device.queue.writeBuffer(cellStateStorage, 0, cellStateArray);
+    ```
+## storage buffer를 shader에서 읽기
+1. grid를 render하기 전에 storage buffer의 내용을 볼 수 있게 shader를 update해야한다. 이전에 uniform이 추가됐던 방법과 유사하다.
+2. shader에 코드 추가
+    ```java
+        @group(0) @binding(0) var<uniform> grid: vec2f;
+        @group(0) @binding(1) var<storage> cellState: array<u32>; // New!
+    ```
+    1. grid uniform 바로 밑에 binding point를 추가한다.
+    2. `@group`을 `grid` uniform으로 계속 유지하되, `@bidinding`숫자는 달라져야한다.
+    3. 단일 벡터가 아니라 다른 타입의 buffer를 반영하기 위해서는 `var`의 type은 `storage`으로 정해야한다. JS의 `Unit32Array`와 일치시키기 위해서는 `cellState`를 `u32`의 배열 타입으로 정해야한다.
+    > **NOTE**: `boolean`이면 충분할텐데 왜 32bit int를 사용하는가? GPU는 오직 몇가지의 타입에 대해서만 data를 깔끔하게 표현하기 때문이다. array of bytes를 노출하는 것을 특정하지 못할 것이다. 왜냐하면 GPU가 data 정렬을 할 때 특정 가정이 제대로 동작하지 않기 때문이다.
+    32개의 다른 cell을 하나의 배열에 저장하는 식으로 bitmasking trick으로 용량을 줄일 수 있다. 이런 GPU에 적용가능한 타입으로 데이터를 pack하는 현명한 방식을 찾기위한 긴 개발 역사를 가지고 있다. 그러나, 코드를 복잡하게 만들기 떄문에 여기서는 생략했다. 메모리의 impact에 대해서 너무 크게 걱정할 필요는 없다.
+3. `@vertex` 함수 몸체에서 cell의 state를 조회(query)한다. 왜냐하면, state는 storage buffer에 flat array로 저장되어 있기 때문에, `instance_index`를 통해서 현재 cell의 값을 조회할 수 있다.
+4. 그러면 cell을 어떻게 inactivate 할 수 있는가?(지금 전부 켜져있으므로). active/inactivate state가 지금 1/0으로 표현되기 때문에, 기하적인 크기(scale)을 조절해서, 0으로 만들면, 해당 지점의 도형이 수축(collapse)되어서 GPU가 버릴 것이다.
+    ```java
+    @vertex
+    fn vertexMain(@location(0) pos: vec2f,
+                @builtin(instance_index) instance: u32) -> VertexOutput {
+        let i = f32(instance);
+        let cell = vec2f(i % grid.x, floor(i / grid.x));
+        let state = f32(cellState[instance]); // New line!
+
+        let cellOffset = cell / grid * 2;
+        // New: Scale the position by the cell's active state.
+        let gridPos = (pos*state+1) / grid - 1 + cellOffset;
+
+        var output: VertexOutput;
+        output.pos = vec4f(gridPos, 0, 1);
+        output.cell = cell;
+        return output;
+    }
+    ```
+    위 코드에서 state를 0.5로 지정하면 scaling이 되고 있다는 사실을 알 수 있다. vertex의 위치가 변경되면서 scaling이 되는 것.
+    ![halfscale](./webGPU-introduce/halfscale.png)
+## bind group에 storage buffer 추가하기
+1. storage buffer를 bind group에 추가해야한다. 왜냐하면 uniform buffer로서 동일한 @group의 부분이기 떄문이다. 동일한 bind group에 추가하기 위해서는 JS 코드를 작성해야한다.
+    ```javascript
+    const bindGroup = device.createBindGroup({
+        label: "Cell renderer bind group",
+        layout: cellPipeline.getBindGroupLayout(0),
+        entries: [{
+            binding: 0,
+            resource: { buffer: uniformBuffer }
+        },
+        // New entry!
+        {
+            binding: 1,
+            resource: { buffer: cellStateStorage }
+        }],
+    });
+    ```
+![inactivate](./webGPU-introduce/inactivate.png);
+
+## ping-pong buffer patter 사용하기
+1. 대부분의 simulation들은 최소 2개의 state 사본을 사용한다.
+2. 각 simulation의 단계에서, 한개의 카피에서 읽고, 다른곳에 작성한다.
+3. 그런다음, 다음 단계에서 이전에 작성한 state를 읽어서 이를 반전시킨다. 이를 ping-pong 패턴이라고 부른다. 왜냐하면 각 단계별로 state의 사본 사이에서 앞뒤로 움직이기 때문이다.
+4. JS 예시코드
+    잘못된 예시
+    ```javascript
+    // Example simulation. Don't copy into the project!
+    const state = [1, 0, 0, 0, 0, 0, 0, 0];
+
+    function simulate() {
+    for (let i = 0; i < state.length-1; ++i) {
+        if (state[i] == 1) {
+            state[i] = 0;
+            state[i+1] = 1;
+        }
+    }
+    }
+
+    simulate(); // Run the simulation for one step.
+    ```
+    이러면 가장 끝의 state만 1이 되고 나머지는 0이 될 것이다.
+
+    ```javascript
+    // Example simulation. Don't copy into the project!
+    const stateA = [1, 0, 0, 0, 0, 0, 0, 0];
+    const stateB = [0, 0, 0, 0, 0, 0, 0, 0];
+
+    function simulate(in, out) {
+        out[0] = 0;
+        for (let i = 1; i < in.length; ++i) {
+            out[i] = in[i-1];
+        }
+    }
+
+    // Run the simulation for two step.
+    simulate(stateA, stateB);
+    simulate(stateB, stateA); 
+    ```
+    이렇게 이전상태를 기반으로 작동해야 원하는 결과를 이끌어낼 수 있다.
+5. 코드
+    ```java
+    // Create two storage buffers to hold the cell state.
+    const cellStateStorage = [
+        device.createBuffer({
+            label: "Cell State A",
+            size: cellStateArray.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        }),
+        device.createBuffer({
+            label: "Cell State B",
+            size: cellStateArray.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        })
+    ];
+    // Mark every third cell of the first grid as active.
+    for (let i = 0; i < cellStateArray.length; i+=3) {
+        cellStateArray[i] = 1;
+    }
+    device.queue.writeBuffer(cellStateStorage[0], 0, cellStateArray);
+
+    // Mark every other cell of the second grid as active.
+    for (let i = 0; i < cellStateArray.length; i++) {
+        cellStateArray[i] = i % 2;
+    }
+    device.queue.writeBuffer(cellStateStorage[1], 0, cellStateArray);
+    ```
+    > **NOTE**: writeBuffer()를 호출할 때, TypedArray를 더 이상 저장할 필요는 없다. 이미 컨텐츠가 GPU buffer로 복사되었기 때문이다. 이를 통해 메모리를 절약할 수 있다.
+6. 다른 stroage buffer를 렌더링 중에 보여주려면, bind groups는 2가지의 다른 변수를 가져야한다.
+    ```javascript
+    const bindGroups = [
+        device.createBindGroup({
+            label: "Cell renderer bind group A",
+            layout: cellPipeline.getBindGroupLayout(0),
+            entries: [{
+                binding: 0,
+                resource: { buffer: uniformBuffer }
+            }, {
+                binding: 1,
+                resource: { buffer: cellStateStorage[0] }
+            }],
+        }),
+        device.createBindGroup({
+            label: "Cell renderer bind group B",
+            layout: cellPipeline.getBindGroupLayout(0),
+            entries: [{
+                binding: 0,
+                resource: { buffer: uniformBuffer }
+            }, {
+                binding: 1,
+                resource: { buffer: cellStateStorage[1] }
+            }],
+        })
+    ];
+    ```
+## render loop 설정
+1. 이제는 시간에 따라 data를 update해야한다. 그러기 위해서 간단한 render loop를 만들어야한다.
+2. render loop는 특정 interval에서 loop를 무한히 돌면서 canvas에 content를 그린다.
+3. 화면 fps와 맞춰서 함수를 호출하려면 `requestAnimationFrame()`을 사용하면된다. 하지만 이번에는 update를 좀 더 긴 주기로 가져가고, simulation을 쉽게 따라가기 위해서 `setInterval`을 사용
+4. 코드 
+    ```javascript
+    const UPDATE_INTERVAL = 200; // Update every 200ms (5 times/sec)
+    let step = 0; // Track how many simulation steps have been run
+
+    // Move all of our rendering code into a function
+    function updateGrid() {
+        step++; // Increment the step count
+        
+        // Start a render pass 
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginRenderPass({
+            colorAttachments: [{
+            view: context.getCurrentTexture().createView(),
+            loadOp: "clear",
+            clearValue: { r: 0, g: 0, b: 0.4, a: 1.0 },
+            storeOp: "store",
+            }]
+        });
+
+        // Draw the grid.
+        pass.setPipeline(cellPipeline);
+        pass.setBindGroup(0, bindGroups[step % 2]); // Updated!
+        pass.setVertexBuffer(0, vertexBuffer);
+        pass.draw(vertices.length / 2, GRID_SIZE * GRID_SIZE);
+
+        // End the render pass and submit the command buffer
+        pass.end();
+        device.queue.submit([encoder.finish()]);
+    }
+
+    // Schedule updateGrid() to run repeatedly
+    setInterval(updateGrid, UPDATE_INTERVAL);
+    ```
+    1. updateGrid는 step을 update하면서 어떤 binding에 연결할지 선택해야한다.
